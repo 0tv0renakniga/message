@@ -48,21 +48,29 @@ ds_target['lon'] = (('y', 'x'), lon_2d)
 ds_target = ds_target.cf.add_bounds(['lat', 'lon'])
 print("✅ Done.")
 
-# 3. Load Source Data (GRACE)
+# 3. Load Source Data (The CLEAN Way)
 print("    Loading Raw GRACE Data...", end=" ")
-ds_mass = xr.open_dataset(GRACE_MASS_FILE)
-ds_land = xr.open_dataset(LAND_MASK_FILE)
-ds_ocean = xr.open_dataset(OCEAN_MASK_FILE)
 
-# Merge and Rename
+# --- MASS DATA ---
+# (Assuming main file uses 'lwe_thickness', if that fails check ncdump)
+ds_mass = xr.open_dataset(GRACE_MASS_FILE)[['lwe_thickness']]
+ds_mass = ds_mass.rename({'lwe_thickness': 'lwe'})
+
+# --- LAND MASK ---
+# Variable is 'LO_val', rename to 'mask_land' immediately
+ds_land = xr.open_dataset(LAND_MASK_FILE)[['LO_val']]
+ds_land = ds_land.rename({'LO_val': 'mask_land'})
+
+# --- OCEAN MASK ---
+# Variable is ALSO 'LO_val', rename to 'mask_ocean' immediately
+ds_ocean = xr.open_dataset(OCEAN_MASK_FILE)[['LO_val']]
+ds_ocean = ds_ocean.rename({'LO_val': 'mask_ocean'})
+
+# --- MERGE ---
+# Now safe because: 'lwe', 'mask_land', 'mask_ocean' are unique names
 ds_source = xr.merge([ds_mass, ds_land, ds_ocean])
-ds_source = ds_source.rename({
-    'lwe_thickness': 'lwe', 
-    'land_mask': 'mask_land', 
-    'ocean_mask': 'mask_ocean'
-})
 
-# Fix Source Bounds (GRACE is sometimes missing them or names them differently)
+# Ensure bounds exist
 if 'lat_b' not in ds_source and 'lat_bounds' not in ds_source:
      ds_source = ds_source.cf.add_bounds(['lat', 'lon'])
 print("✅ Done.")
