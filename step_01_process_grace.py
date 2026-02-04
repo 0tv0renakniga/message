@@ -1,8 +1,7 @@
 import xarray as xr
-import xesmf as xe
 import numpy as np
 import os
-import dask.array as da
+from dask.distributed import Client
 from pyproj import Transformer
 
 # --- PATHS ---
@@ -14,100 +13,92 @@ LAND_MASK_FILE  = f"{RAW_DIR}/CSR_GRACE_GRACE-FO_RL06_Mascons_LandMask.nc"
 OCEAN_MASK_FILE = f"{RAW_DIR}/CSR_GRACE_GRACE-FO_RL06_Mascons_OceanMask.nc"
 MASTER_GRID     = f"{PROC_DIR}/master_grid_template.nc"
 OUTPUT_ZARR     = f"{PROC_DIR}/grace_500m.zarr"
-WEIGHTS_FILE    = f"{PROC_DIR}/grace_bilinear_weights.nc" # New filename for new method
 
 # Safety Check
 for f in [GRACE_MASS_FILE, LAND_MASK_FILE, OCEAN_MASK_FILE, MASTER_GRID]:
     if not os.path.exists(f):
         raise FileNotFoundError(f"❌ Missing file: {f}")
 
-# Cleanup: Delete old/partial weights to prevent "Corrupted File" errors
-if os.path.exists(WEIGHTS_FILE):
-    os.remove(WEIGHTS_FILE)
+if __name__ == "__main__":
+    # 1. SETUP DASK CLIENT
+    # 16GB limit (4x4GB) prevents the crash while enabling parallelism
+    client = Client(n_workers=4, threads_per_worker=1, memory_limit='4GB')
+    print(f">>> ⚡ Dask Client Running: {client.dashboard_link}")
+    print(f">>> 🛰️ PROCESSING GRACE (Nearest Neighbor - Preserving Raw Values)...")
 
-print(f">>> 🛰️ PROCESSING GRACE (Bilinear Method - Fast & Low RAM)...")
+    # =========================================================
+    # 2. PREPARE TARGET GRID
+    # =========================================================
+    print("    Preparing Target Grid...", end=" ")
+    ds_target = xr.open_dataset(MASTER_GRID)
 
-# =========================================================
-# 1. PREPARE TARGET GRID (Standard Setup)
-# =========================================================
-print("    Preparing Target Grid...", end=" ")
-ds_target = xr.open_dataset(MASTER_GRID)
+    # Calculate Lat/Lon for every 500m pixel (Query Points)
+    X, Y = np.meshgrid(ds_target['x'].values, ds_target['y'].values)
+    transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
+    lon_c, lat_c = transformer.transform(X, Y)
 
-# Generate Coordinates (Centers only - Bilinear doesn't need bounds!)
-rows, cols = ds_target.sizes['y'], ds_target.sizes['x']
-X, Y = np.meshgrid(ds_target['x'].values, ds_target['y'].values)
+    ds_target['lat'] = (('y', 'x'), lat_c)
+    ds_target['lon'] = (('y', 'x'), lon_c)
+    ds_target = ds_target.set_coords(['lat', 'lon'])
+    print("✅ Done.")
 
-transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
-lon_c, lat_c = transformer.transform(X, Y)
+    # =========================================================
+    # 3. PREPARE SOURCE DATA
+    # =========================================================
+    print("    Loading Source Data...", end=" ")
 
-ds_target['lat'] = (('y', 'x'), lat_c)
-ds_target['lon'] = (('y', 'x'), lon_c)
-ds_target = ds_target.set_coords(['lat', 'lon'])
-print("✅ Done.")
+    # Chunking time=1 enables Dask Streaming
+    ds_mass = xr.open_dataset(GRACE_MASS_FILE, chunks={'time': 1})[['lwe_thickness']]
+    ds_mass = ds_mass.rename({'lwe_thickness': 'lwe'})
 
-# =========================================================
-# 2. PREPARE SOURCE GRID (Centers Only)
-# =========================================================
-print("    Preparing Source Grid...", end=" ")
-ds_mass_coords = xr.open_dataset(GRACE_MASS_FILE)[['lat', 'lon']]
-if 'latitude' in ds_mass_coords: ds_mass_coords = ds_mass_coords.rename({'latitude': 'lat', 'longitude': 'lon'})
+    ds_land = xr.open_dataset(LAND_MASK_FILE, chunks={})[['LO_val']].rename({'LO_val': 'mask_land'})
+    ds_ocean = xr.open_dataset(OCEAN_MASK_FILE, chunks={})[['LO_val']].rename({'LO_val': 'mask_ocean'})
 
-# Note: We DO NOT need to calculate bounds for Bilinear!
-print("✅ Done.")
+    ds_source = xr.merge([ds_mass, ds_land, ds_ocean])
 
-# =========================================================
-# 3. BUILD REGRIDDER (Bilinear)
-# =========================================================
-print(f"    Building Regridder (Bilinear)...")
-# This should take SECONDS, not minutes.
-regridder = xe.Regridder(
-    ds_mass_coords, 
-    ds_target, 
-    method='bilinear',   # <--- THE FIX
-    periodic=True,
-    filename=WEIGHTS_FILE
-)
-print("✅ Regridder Ready.")
+    # Standardize names for interpolation
+    rename_dict = {}
+    if 'latitude' in ds_source.coords: rename_dict['latitude'] = 'lat'
+    if 'longitude' in ds_source.coords: rename_dict['longitude'] = 'lon'
+    ds_source = ds_source.rename(rename_dict)
+    print("✅ Done.")
 
-# =========================================================
-# 4. STREAMING PROCESSING
-# =========================================================
-print("    Processing Data Stream...", end=" ")
+    # =========================================================
+    # 4. INTERPOLATION (Nearest Neighbor)
+    # =========================================================
+    print("    Interpolating (Nearest Neighbor)...", end=" ")
 
-# Load Data Chunked
-ds_mass = xr.open_dataset(GRACE_MASS_FILE, chunks={'time': 1})[['lwe_thickness']].rename({'lwe_thickness': 'lwe'})
-if 'latitude' in ds_mass.coords: ds_mass = ds_mass.rename({'latitude': 'lat', 'longitude': 'lon'})
+    # method='nearest' preserves the exact "block" value of the satellite data.
+    # It does not smooth edges. It does not crash RAM.
+    ds_out = ds_source.interp(
+        lat=ds_target['lat'], 
+        lon=ds_target['lon'], 
+        method='nearest'
+    )
+    print("✅ Graph Built.")
 
-# Masks
-ds_land = xr.open_dataset(LAND_MASK_FILE, chunks={})[['LO_val']].rename({'LO_val': 'mask_land'})
-ds_ocean = xr.open_dataset(OCEAN_MASK_FILE, chunks={})[['LO_val']].rename({'LO_val': 'mask_ocean'})
-for ds in [ds_land, ds_ocean]:
-    if 'latitude' in ds.coords: ds = ds.rename({'latitude': 'lat', 'longitude': 'lon'})
+    # =========================================================
+    # 5. SAVE
+    # =========================================================
+    print(f"    Streaming to {OUTPUT_ZARR}...", end=" ")
 
-ds_source = xr.merge([ds_mass, ds_land, ds_ocean])
+    ds_final = xr.Dataset({
+        'lwe_thickness': ds_out['lwe'],
+        'grace_land_frac': ds_out['mask_land'],
+        'grace_ocean_frac': ds_out['mask_ocean']
+    })
 
-# Apply Regridder
-# Bilinear interpolation is just a weighted average of the 4 nearest neighbors. Very fast.
-lwe_500m = regridder(ds_source['lwe']).astype('float32')
-land_frac = regridder(ds_source['mask_land']).astype('float32')
-ocean_frac = regridder(ds_source['mask_ocean']).astype('float32')
-print("✅ Done.")
+    # Clean encoding to prevent chunk conflicts
+    for var in ds_final.variables:
+        ds_final[var].encoding.pop('chunks', None)
 
-# =========================================================
-# 5. SAVE
-# =========================================================
-print(f"    Writing to {OUTPUT_ZARR}...", end=" ")
-ds_out = xr.Dataset({
-    'lwe_thickness': lwe_500m,
-    'grace_land_frac': land_frac,
-    'grace_ocean_frac': ocean_frac
-})
+    # Output chunks optimized for Zarr reading later
+    ds_final = ds_final.chunk({'time': 1, 'y': 2048, 'x': 2048})
 
-for var in ds_out.variables:
-    ds_out[var].encoding.pop('chunks', None)
+    # Execute via Client
+    ds_final.to_zarr(OUTPUT_ZARR, mode='w', computed=True)
 
-ds_out = ds_out.chunk({'time': 1, 'y': 2048, 'x': 2048})
-ds_out.to_zarr(OUTPUT_ZARR, mode='w', computed=True)
-
-print("✅ SAVED.")
-print(">>> 🏁 PHASE 1 (GRACE) COMPLETE.")
+    print("✅ SAVED.")
+    print(">>> 🏁 PHASE 1 (GRACE) COMPLETE.")
+    
+    client.close()
