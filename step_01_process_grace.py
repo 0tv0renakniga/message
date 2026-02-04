@@ -22,10 +22,10 @@ for f in [GRACE_MASS_FILE, LAND_MASK_FILE, OCEAN_MASK_FILE, MASTER_GRID]:
     if not os.path.exists(f):
         raise FileNotFoundError(f"❌ Missing file: {f}")
 
-print(f">>> 🛰️ PROCESSING GRACE (Final Alignment Fix)...")
+print(f">>> 🛰️ PROCESSING GRACE (Coordinates Fix)...")
 
 # =========================================================
-# 1. PREPARE TARGET GRID (Strict Bounds Math)
+# 1. PREPARE TARGET GRID (Set Coords explicitly)
 # =========================================================
 print("    Preparing Target Grid...", end=" ")
 
@@ -42,30 +42,31 @@ ds_target['mask'] = (('y', 'x'), da.ones((rows, cols), chunks=chunks, dtype='int
 X, Y = np.meshgrid(ds_target['x'].values, ds_target['y'].values)
 
 # C. Generate Bounds (Using Linspace to guarantee N+1)
-# Grid definition: -3,072,000 to 3,072,000.
-# Left Edge: x[0] - 250. Right Edge: x[-1] + 250.
 x_min = ds_target['x'].values[0] - 250.0
 x_max = ds_target['x'].values[-1] + 250.0
-y_max = ds_target['y'].values[0] + 250.0  # Top (Y is inverted)
+y_max = ds_target['y'].values[0] + 250.0
 y_min = ds_target['y'].values[-1] - 250.0
 
-# Force exact count: Pixels + 1
 x_b = np.linspace(x_min, x_max, cols + 1)
-y_b = np.linspace(y_max, y_min, rows + 1) # Note y_max first for descending Y
+y_b = np.linspace(y_max, y_min, rows + 1)
 X_b, Y_b = np.meshgrid(x_b, y_b)
 
-# D. Reproject to Lat/Lon
+# D. Reproject
 transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
 lon_b, lat_b = transformer.transform(X_b, Y_b)
 lon_c, lat_c = transformer.transform(X, Y)
 
-# E. Assign with Standard Names
+# E. Assign Variables
 ds_target['latitude'] = (('y', 'x'), lat_c)
 ds_target['longitude'] = (('y', 'x'), lon_c)
 ds_target['lat_b'] = (('y_b', 'x_b'), lat_b)
 ds_target['lon_b'] = (('y_b', 'x_b'), lon_b)
 
-# F. Attributes (Critical for cf-xarray)
+# F. CRITICAL FIX: Promote to Coordinates
+# This prevents Dask from trying to chunk them and failing on the size mismatch
+ds_target = ds_target.set_coords(['latitude', 'longitude', 'lat_b', 'lon_b'])
+
+# G. Attributes
 ds_target['latitude'].attrs = {'units': 'degrees_north', 'standard_name': 'latitude'}
 ds_target['longitude'].attrs = {'units': 'degrees_east', 'standard_name': 'longitude'}
 ds_target['lat_b'].attrs = {'units': 'degrees_north'}
@@ -133,7 +134,7 @@ ds_out = xr.Dataset({
     'grace_ocean_frac': ocean_frac
 })
 
-# Explicitly clear encoding to stop the "chunks separate" warning
+# Clear chunks encoding
 for var in ds_out.variables:
     ds_out[var].encoding.pop('chunks', None)
 
