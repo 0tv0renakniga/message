@@ -23,76 +23,89 @@ for f in [GRACE_MASS_FILE, LAND_MASK_FILE, OCEAN_MASK_FILE, MASTER_GRID]:
 
 print(f">>> 🛰️ PROCESSING GRACE (Conservative Regridding)...")
 
-# 1. Load the Master Grid (Target)
+# =========================================================
+# 1. PREPARE TARGET GRID (With Manual 2D Bounds)
+# =========================================================
+print("    Preparing Target Grid & Bounds...", end=" ")
 ds_target = xr.open_dataset(MASTER_GRID)
-
-# CRITICAL FIX: Ensure CRS is set after loading
 ds_target.rio.write_crs("EPSG:3031", inplace=True)
 
-# 2. Generate 2D Lat/Lon Arrays (The Math Way)
-# We do this manually to ensure dimensions match perfectly
-print("    Calculating Target Coordinates...", end=" ")
-
-# Create a 2D mesh of X and Y coordinates
+# A. Center Coordinates (for reference)
 X, Y = np.meshgrid(ds_target['x'], ds_target['y'])
 
-# Transform from EPSG:3031 (Antarctica) to EPSG:4326 (Lat/Lon)
+# B. Corner Coordinates (REQUIRED for Conservative Regridding)
+# We need to calculate the edges of every 500m pixel
+res = 500.0
+x_b = np.arange(ds_target['x'][0] - res/2, ds_target['x'][-1] + res, res)
+y_b = np.arange(ds_target['y'][0] + res/2, ds_target['y'][-1] - res, -res)
+X_b, Y_b = np.meshgrid(x_b, y_b)
+
+# C. Reproject Corners to Lat/Lon (2D)
 transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
-lon_2d, lat_2d = transformer.transform(X, Y)
+lon_b, lat_b = transformer.transform(X_b, Y_b)
+lon_c, lat_c = transformer.transform(X, Y)
 
-# Assign these 2D arrays back to the dataset
-ds_target['lat'] = (('y', 'x'), lat_2d)
-ds_target['lon'] = (('y', 'x'), lon_2d)
-
-# Add bounds (Now works because we have valid 2D lat/lon)
-ds_target = ds_target.cf.add_bounds(['lat', 'lon'])
+# D. Assign to Dataset
+ds_target['lat'] = (('y', 'x'), lat_c)
+ds_target['lon'] = (('y', 'x'), lon_c)
+ds_target['lat_b'] = (('y_b', 'x_b'), lat_b)
+ds_target['lon_b'] = (('y_b', 'x_b'), lon_b)
 print("✅ Done.")
 
-# 3. Load Source Data (The CLEAN Way)
-print("    Loading Raw GRACE Data...", end=" ")
+# =========================================================
+# 2. PREPARE SOURCE DATA (Fixing Ghost Bounds)
+# =========================================================
+print("    Loading & Cleaning GRACE Data...", end=" ")
 
-# --- MASS DATA ---
-# (Assuming main file uses 'lwe_thickness', if that fails check ncdump)
+# A. Load and Fix Mass Data
 ds_mass = xr.open_dataset(GRACE_MASS_FILE)[['lwe_thickness']]
 ds_mass = ds_mass.rename({'lwe_thickness': 'lwe'})
 
-# --- LAND MASK ---
-# Variable is 'LO_val', rename to 'mask_land' immediately
-ds_land = xr.open_dataset(LAND_MASK_FILE)[['LO_val']]
-ds_land = ds_land.rename({'LO_val': 'mask_land'})
+# FIX: Remove broken 'bounds' attributes if they point to missing vars
+for coord in ['lat', 'lon']:
+    if 'bounds' in ds_mass[coord].attrs:
+        del ds_mass[coord].attrs['bounds']
 
-# --- OCEAN MASK ---
-# Variable is ALSO 'LO_val', rename to 'mask_ocean' immediately
-ds_ocean = xr.open_dataset(OCEAN_MASK_FILE)[['LO_val']]
-ds_ocean = ds_ocean.rename({'LO_val': 'mask_ocean'})
+# Generate fresh bounds
+ds_mass = ds_mass.cf.add_bounds(['lat', 'lon'])
 
-# --- MERGE ---
-# Now safe because: 'lwe', 'mask_land', 'mask_ocean' are unique names
+# B. Load and Fix Masks (Rename colliding 'LO_val')
+ds_land = xr.open_dataset(LAND_MASK_FILE)[['LO_val']].rename({'LO_val': 'mask_land'})
+ds_ocean = xr.open_dataset(OCEAN_MASK_FILE)[['LO_val']].rename({'LO_val': 'mask_ocean'})
+
+# Remove broken bounds from masks too (just in case)
+for ds in [ds_land, ds_ocean]:
+    for coord in ['lat', 'lon']:
+        if 'bounds' in ds[coord].attrs:
+            del ds[coord].attrs['bounds']
+
+# C. Merge
 ds_source = xr.merge([ds_mass, ds_land, ds_ocean])
-
-# Ensure bounds exist
-if 'lat_b' not in ds_source and 'lat_bounds' not in ds_source:
-     ds_source = ds_source.cf.add_bounds(['lat', 'lon'])
 print("✅ Done.")
 
-# 4. Build the Regridder
-print("    Building Conservative Regridder (This takes a moment)...")
+# =========================================================
+# 3. REGRIDDING
+# =========================================================
+print("    Building Conservative Regridder...", end=" ")
+# Now both Source and Target have valid lat_b/lon_b
 regridder = xe.Regridder(
     ds_source, 
     ds_target, 
     method='conservative_normed',
     periodic=True
 )
+print("✅ Built.")
 
-# 5. Execute Regridding
-print("    Regridding Variables...", end=" ")
-# The .astype('float32') saves disk space (GRACE precision doesn't need 64-bit)
+print("    Regridding...", end=" ")
+# Regrid and Cast to float32 to save space
 lwe_500m = regridder(ds_source['lwe']).astype('float32')
 land_frac = regridder(ds_source['mask_land']).astype('float32')
 ocean_frac = regridder(ds_source['mask_ocean']).astype('float32')
 print("✅ Done.")
 
-# 6. Save to Zarr
+# =========================================================
+# 4. SAVE
+# =========================================================
 print(f"    Saving to {OUTPUT_ZARR}...", end=" ")
 ds_out = xr.Dataset({
     'lwe_thickness': lwe_500m,
@@ -100,8 +113,6 @@ ds_out = xr.Dataset({
     'grace_ocean_frac': ocean_frac
 })
 
-# Save chunked
+# Chunk for spatial access
 ds_out.chunk({'time': 1, 'y': 2000, 'x': 2000}).to_zarr(OUTPUT_ZARR, mode='w')
-
 print("✅ SAVED.")
-print(">>> 🏁 PHASE 1 (GRACE) COMPLETE.")
