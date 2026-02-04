@@ -21,25 +21,32 @@ for f in [GRACE_MASS_FILE, LAND_MASK_FILE, OCEAN_MASK_FILE, MASTER_GRID]:
     if not os.path.exists(f):
         raise FileNotFoundError(f"❌ Missing file: {f}")
 
-print(f">>> 🛰️ PROCESSING GRACE (Dask Optimized)...")
+print(f">>> 🛰️ PROCESSING GRACE (Dask Parallel Mode)...")
 
 # =========================================================
-# 1. PREPARE TARGET GRID (Manual Bounds)
+# 1. PREPARE TARGET GRID (Chunked + Manual Bounds)
 # =========================================================
 print("    Preparing Target Grid & Bounds...", end=" ")
-ds_target = xr.open_dataset(MASTER_GRID)
+
+# FIX: Chunk the target grid so Dask can write to it in parallel
+ds_target = xr.open_dataset(MASTER_GRID, chunks={'y': 2048, 'x': 2048})
 ds_target.rio.write_crs("EPSG:3031", inplace=True)
 
-X, Y = np.meshgrid(ds_target['x'], ds_target['y'])
+# Generate Coordinates (we use compute() here because coordinates must be in memory for the Transformer)
+X, Y = np.meshgrid(ds_target['x'].values, ds_target['y'].values)
+
+# Generate Manual Bounds for Conservation
 res = 500.0
 x_b = np.arange(ds_target['x'][0] - res/2, ds_target['x'][-1] + res, res)
 y_b = np.arange(ds_target['y'][0] + res/2, ds_target['y'][-1] - res, -res)
 X_b, Y_b = np.meshgrid(x_b, y_b)
 
+# Transform to Lat/Lon
 transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
 lon_b, lat_b = transformer.transform(X_b, Y_b)
 lon_c, lat_c = transformer.transform(X, Y)
 
+# Assign back to dataset
 ds_target['lat'] = (('y', 'x'), lat_c)
 ds_target['lon'] = (('y', 'x'), lon_c)
 ds_target['lat_b'] = (('y_b', 'x_b'), lat_b)
@@ -51,19 +58,20 @@ print("✅ Done.")
 # =========================================================
 print("    Loading & Cleaning GRACE Data (Lazy)...", end=" ")
 
-# CRITICAL: chunks={'time': 1} enables Dask
+# CRITICAL: chunks={'time': 1} enables Dask Streaming
 ds_mass = xr.open_dataset(GRACE_MASS_FILE, chunks={'time': 1})[['lwe_thickness']]
 ds_mass = ds_mass.rename({'lwe_thickness': 'lwe'})
 
-# Remove broken bounds
+# Remove broken bounds if present
 for coord in ['lat', 'lon']:
     if 'bounds' in ds_mass[coord].attrs:
         del ds_mass[coord].attrs['bounds']
+# Add fresh bounds
 ds_mass = ds_mass.cf.add_bounds(['lat', 'lon'])
 
-# Masks don't have time, so no chunking needed there
-ds_land = xr.open_dataset(LAND_MASK_FILE)[['LO_val']].rename({'LO_val': 'mask_land'})
-ds_ocean = xr.open_dataset(OCEAN_MASK_FILE)[['LO_val']].rename({'LO_val': 'mask_ocean'})
+# Masks (Static, but we chunk them to match the pipeline)
+ds_land = xr.open_dataset(LAND_MASK_FILE, chunks={})[['LO_val']].rename({'LO_val': 'mask_land'})
+ds_ocean = xr.open_dataset(OCEAN_MASK_FILE, chunks={})[['LO_val']].rename({'LO_val': 'mask_ocean'})
 
 # Remove broken bounds from masks
 for ds in [ds_land, ds_ocean]:
@@ -79,7 +87,7 @@ print("✅ Done.")
 # 3. REGRIDDING
 # =========================================================
 print("    Building Regridder (Parallel)...", end=" ")
-# parallel=True speeds up weight generation
+# parallel=True now works because both ds_source and ds_target are chunked
 regridder = xe.Regridder(
     ds_source, 
     ds_target, 
@@ -89,9 +97,8 @@ regridder = xe.Regridder(
 )
 print("✅ Built.")
 
-print("    Regridding (Lazy Graph Construction)...", end=" ")
-# Because inputs are chunked (Dask), this returns a Dask Array immediately
-# It does NOT compute the 150GB result yet.
+print("    Regridding (Lazy)...", end=" ")
+# This builds the graph, does not compute yet
 lwe_500m = regridder(ds_source['lwe']).astype('float32')
 land_frac = regridder(ds_source['mask_land']).astype('float32')
 ocean_frac = regridder(ds_source['mask_ocean']).astype('float32')
@@ -107,9 +114,11 @@ ds_out = xr.Dataset({
     'grace_ocean_frac': ocean_frac
 })
 
-# We maintain the chunk structure
-# The computation happens HERE, one chunk at a time, keeping RAM usage low.
+# Re-chunk for optimal Zarr writing
 ds_out = ds_out.chunk({'time': 1, 'y': 2048, 'x': 2048})
+
+# Write (The computation happens here)
 ds_out.to_zarr(OUTPUT_ZARR, mode='w', computed=True)
 
 print("✅ SAVED.")
+print(">>> 🏁 PHASE 1 (GRACE) COMPLETE.")
