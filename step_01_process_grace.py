@@ -21,31 +21,25 @@ for f in [GRACE_MASS_FILE, LAND_MASK_FILE, OCEAN_MASK_FILE, MASTER_GRID]:
     if not os.path.exists(f):
         raise FileNotFoundError(f"❌ Missing file: {f}")
 
-print(f">>> 🛰️ PROCESSING GRACE (Conservative Regridding)...")
+print(f">>> 🛰️ PROCESSING GRACE (Dask Optimized)...")
 
 # =========================================================
-# 1. PREPARE TARGET GRID (With Manual 2D Bounds)
+# 1. PREPARE TARGET GRID (Manual Bounds)
 # =========================================================
 print("    Preparing Target Grid & Bounds...", end=" ")
 ds_target = xr.open_dataset(MASTER_GRID)
 ds_target.rio.write_crs("EPSG:3031", inplace=True)
 
-# A. Center Coordinates (for reference)
 X, Y = np.meshgrid(ds_target['x'], ds_target['y'])
-
-# B. Corner Coordinates (REQUIRED for Conservative Regridding)
-# We need to calculate the edges of every 500m pixel
 res = 500.0
 x_b = np.arange(ds_target['x'][0] - res/2, ds_target['x'][-1] + res, res)
 y_b = np.arange(ds_target['y'][0] + res/2, ds_target['y'][-1] - res, -res)
 X_b, Y_b = np.meshgrid(x_b, y_b)
 
-# C. Reproject Corners to Lat/Lon (2D)
 transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
 lon_b, lat_b = transformer.transform(X_b, Y_b)
 lon_c, lat_c = transformer.transform(X, Y)
 
-# D. Assign to Dataset
 ds_target['lat'] = (('y', 'x'), lat_c)
 ds_target['lon'] = (('y', 'x'), lon_c)
 ds_target['lat_b'] = (('y_b', 'x_b'), lat_b)
@@ -53,66 +47,69 @@ ds_target['lon_b'] = (('y_b', 'x_b'), lon_b)
 print("✅ Done.")
 
 # =========================================================
-# 2. PREPARE SOURCE DATA (Fixing Ghost Bounds)
+# 2. PREPARE SOURCE DATA (Lazy Loading)
 # =========================================================
-print("    Loading & Cleaning GRACE Data...", end=" ")
+print("    Loading & Cleaning GRACE Data (Lazy)...", end=" ")
 
-# A. Load and Fix Mass Data
-ds_mass = xr.open_dataset(GRACE_MASS_FILE)[['lwe_thickness']]
+# CRITICAL: chunks={'time': 1} enables Dask
+ds_mass = xr.open_dataset(GRACE_MASS_FILE, chunks={'time': 1})[['lwe_thickness']]
 ds_mass = ds_mass.rename({'lwe_thickness': 'lwe'})
 
-# FIX: Remove broken 'bounds' attributes if they point to missing vars
+# Remove broken bounds
 for coord in ['lat', 'lon']:
     if 'bounds' in ds_mass[coord].attrs:
         del ds_mass[coord].attrs['bounds']
-
-# Generate fresh bounds
 ds_mass = ds_mass.cf.add_bounds(['lat', 'lon'])
 
-# B. Load and Fix Masks (Rename colliding 'LO_val')
+# Masks don't have time, so no chunking needed there
 ds_land = xr.open_dataset(LAND_MASK_FILE)[['LO_val']].rename({'LO_val': 'mask_land'})
 ds_ocean = xr.open_dataset(OCEAN_MASK_FILE)[['LO_val']].rename({'LO_val': 'mask_ocean'})
 
-# Remove broken bounds from masks too (just in case)
+# Remove broken bounds from masks
 for ds in [ds_land, ds_ocean]:
     for coord in ['lat', 'lon']:
         if 'bounds' in ds[coord].attrs:
             del ds[coord].attrs['bounds']
 
-# C. Merge
+# Merge
 ds_source = xr.merge([ds_mass, ds_land, ds_ocean])
 print("✅ Done.")
 
 # =========================================================
 # 3. REGRIDDING
 # =========================================================
-print("    Building Conservative Regridder...", end=" ")
-# Now both Source and Target have valid lat_b/lon_b
+print("    Building Regridder (Parallel)...", end=" ")
+# parallel=True speeds up weight generation
 regridder = xe.Regridder(
     ds_source, 
     ds_target, 
     method='conservative_normed',
-    periodic=True
+    periodic=True,
+    parallel=True 
 )
 print("✅ Built.")
 
-print("    Regridding...", end=" ")
-# Regrid and Cast to float32 to save space
+print("    Regridding (Lazy Graph Construction)...", end=" ")
+# Because inputs are chunked (Dask), this returns a Dask Array immediately
+# It does NOT compute the 150GB result yet.
 lwe_500m = regridder(ds_source['lwe']).astype('float32')
 land_frac = regridder(ds_source['mask_land']).astype('float32')
 ocean_frac = regridder(ds_source['mask_ocean']).astype('float32')
 print("✅ Done.")
 
 # =========================================================
-# 4. SAVE
+# 4. SAVE (Stream to Disk)
 # =========================================================
-print(f"    Saving to {OUTPUT_ZARR}...", end=" ")
+print(f"    Streaming to {OUTPUT_ZARR}...", end=" ")
 ds_out = xr.Dataset({
     'lwe_thickness': lwe_500m,
     'grace_land_frac': land_frac,
     'grace_ocean_frac': ocean_frac
 })
 
-# Chunk for spatial access
-ds_out.chunk({'time': 1, 'y': 2000, 'x': 2000}).to_zarr(OUTPUT_ZARR, mode='w')
+# We maintain the chunk structure
+# The computation happens HERE, one chunk at a time, keeping RAM usage low.
+ds_out = ds_out.chunk({'time': 1, 'y': 2048, 'x': 2048})
+ds_out.to_zarr(OUTPUT_ZARR, mode='w', computed=True)
+
 print("✅ SAVED.")
