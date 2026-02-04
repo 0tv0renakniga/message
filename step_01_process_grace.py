@@ -86,6 +86,8 @@ if __name__ == "__main__":
     ds_static.to_zarr(OUTPUT_ZARR, mode='w', compute=True)
     print("Done.")
 
+  # ... (Keep your existing Setup, Target Grid, and Static Mask sections) ...
+
     # =========================================================
     # 4. PREPARE SOURCE DATA
     # =========================================================
@@ -96,55 +98,67 @@ if __name__ == "__main__":
     print("Done.")
 
     # =========================================================
-    # 5. BATCH PROCESSING LOOP (Streamlined)
+    # 5. PRE-ALLOCATE ZARR STORE (The Fix)
     # =========================================================
-    times = ds_mass.time.values
-    total_steps = len(times)
-    print(f"    [4/5] Batching {total_steps} time steps (Batch Size: {BATCH_SIZE})...")
+    print("    [4/5] Pre-allocating Zarr Store...", end=" ")
+    
+    # 1. Define the full shape of the output
+    total_steps = len(ds_mass.time)
+    ny, nx = ds_target['lat'].shape
+    
+    # 2. Create a "dummy" Dask array representing the full final variable
+    #    We use the exact chunk size we want on disk (1, 2048, 2048)
+    import dask.array as da
+    dummy_data = da.empty((total_steps, ny, nx), chunks=(1, 2048, 2048), dtype=np.float32)
+    
+    # 3. Create a template dataset
+    ds_template = xr.Dataset(
+        {'lwe': (('time', 'y', 'x'), dummy_data)},
+        coords={
+            'time': ds_mass.time.values,
+            'y': ds_target.y.values,
+            'x': ds_target.x.values
+        }
+    )
+    
+    # 4. Write the METADATA only (compute=False)
+    #    mode='a' appends this new variable to the store we created in step 3 (masks)
+    ds_template.to_zarr(OUTPUT_ZARR, mode='a', compute=False)
+    print(f"Done. (Created slots for {total_steps} time steps)")
 
-    # Loop exactly like your reference script
+    # =========================================================
+    # 6. BATCH PROCESSING LOOP (Region Mode)
+    # =========================================================
+    print(f"    [5/5] Processing Batches (Batch Size: {BATCH_SIZE})...")
+
     for i in range(0, total_steps, BATCH_SIZE):
-        
-        # 1. Select the batch
+        # 1. Select Batch
         current_times = times[i : i + BATCH_SIZE]
         
-        # 🟢 CRITICAL FIX: Load data to RAM for speed, BUT immediately chunk it.
-        # This tricks xarray into using Dask for the subsequent 'interp', 
-        # preventing it from allocating the full 500m grid in RAM at once.
-        ds_batch = ds_mass.sel(time=current_times).load()
-        ds_batch = ds_batch.chunk({'time': 1}) 
-
-        # 2. Interpolate (Lazy due to chunks)
+        # 2. Load Source -> Chunk -> Interp
+        #    We load source to RAM (small) then immediately chunk to force Lazy execution
+        ds_batch = ds_mass.sel(time=current_times).load().chunk({'time': 1})
+        
         ds_batch_out = ds_batch.interp(
             lat=ds_target['lat'],
             lon=ds_target['lon'],
             method='nearest'
         )
 
-        # 3. Re-chunk for Zarr structure
+        # 3. Re-chunk to match the Zarr target exactly
         ds_batch_out = ds_batch_out.chunk({'time': 1, 'y': 2048, 'x': 2048})
+
+        # 4. Write to Region
+        #    We drop coordinates here because they are already written in the file.
+        #    This prevents Xarray from trying to check/rewrite them, saving memory.
+        ds_write = ds_batch_out[['lwe']].drop_vars(['time', 'y', 'x'])
         
-        # Clean encoding
-        if 'chunks' in ds_batch_out['lwe'].encoding:
-            del ds_batch_out['lwe'].encoding['chunks']
+        ds_write.to_zarr(
+            OUTPUT_ZARR, 
+            region={'time': slice(i, i + BATCH_SIZE)}
+        )
+        
+        print(f"        Batch {i+1}-{min(i+BATCH_SIZE, total_steps)} written.")
 
-        # 4. Write
-        if i == 0:
-            # First batch: Append the NEW variable 'lwe' to existing store (from step 3)
-            # mode='a' is correct here because the Zarr store exists (contains static masks)
-            # but we are adding a new variable.
-            ds_batch_out.to_zarr(OUTPUT_ZARR, mode='a', compute=True)
-        else:
-            # Subsequent batches: Append along Time
-            ds_batch_out.to_zarr(OUTPUT_ZARR, mode='a', append_dim='time', compute=True)
-
-        print(f"        Batch {i+1}-{min(i+BATCH_SIZE, total_steps)} / {total_steps} saved.")
-
-    # =========================================================
-    # 6. FINALIZE
-    # =========================================================
-    print("    [5/5] Consolidating Metadata...", end=" ")
-    zarr.consolidate_metadata(OUTPUT_ZARR)
-    print("Done.")
-    
-    client.close()
+    print(">>> 🏁 PHASE 1 (GRACE) COMPLETE.")
+    client.close() 
