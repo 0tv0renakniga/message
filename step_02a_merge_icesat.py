@@ -1,215 +1,194 @@
 """
 step_02a_merge_icesat_tiles.py
 
-Phase: 1 (ICESat-2 Processing)
-Goal: Merge 4 ATL15 tiles (A1-A4) into a seamless 1km Zarr dataset.
-Critical Constraints:
-    - Must handle ATL15 Group structure (/delta_h, /dhdt_lag1).
-    - Must enforce coordinate monotonicity (y-descending, x-ascending).
-    - Must decode custom time units (days since 2018-01-01).
-
-References:
-    - Master Plan Sec 3.2: Merging Strategy [5]
-    - Plot Raw ICESat: Coordinate Monotonicity [1]
-    - Inspect NetCDF: File Patterns [3]
+PRINCIPAL ENGINEER NOTES:
+-------------------------
+1. Objective: Merge ATL15 quadrants (A1-A4) into seamless 1km intermediate products.
+2. Physics: "Lowest Uncertainty First" (Source: [3]). 
+   - We calculate a 'Winner Index' based on the sigma variable.
+   - This index drives the selection for ALL associated variables.
+3. Operations: Includes TEST_MODE for rapid validation (Source: [1]).
 """
 
-import xarray as xr
+import os
+import warnings
 import numpy as np
-import pandas as pd
-import dask.config
+import xarray as xr
+import dask.array as da
 from dask.distributed import Client, LocalCluster
-from pathlib import Path
-import logging
-import shutil
+from pyproj import CRS
 
-# --- Configuration ---
-TEST_MODE = True  # Set False for full production run
-INPUT_DIR = Path("data/raw/icesat")
-OUTPUT_DIR = Path("data/processed_layers")
-INTERMEDIATE_ZARR = OUTPUT_DIR / "icesat2_1km_seamless.zarr"
+# Suppress minor geospatial warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# Corrected Configuration [3]
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# >>> TEST FLAG <<<
+TEST_MODE = True  # Set to False for Production Run
+
+CRS_EPSG = "EPSG:3031"
+INPUT_DIR = "data/raw/icesat"
+OUTPUT_DIR = "data/processed_layers/intermediate"
+
+TILES = {
+    'A1': f"{INPUT_DIR}/ATL15_A1_0328_01km_005_01.nc",
+    'A2': f"{INPUT_DIR}/ATL15_A2_0328_01km_005_01.nc",
+    'A3': f"{INPUT_DIR}/ATL15_A3_0328_01km_005_01.nc",
+    'A4': f"{INPUT_DIR}/ATL15_A4_0328_01km_005_01.nc",
+}
+
 GROUPS = {
     'delta_h': {
-        'vars': ['delta_h', 'delta_h_sigma', 'ice_area', 'data_count', 'misfit_rms'],
-        'suffix': 'deltah'
+        'nc_group': 'delta_h',
+        'sigma_var': 'delta_h_sigma',
+        'vars_to_keep': ['delta_h', 'delta_h_sigma', 'ice_area', 'data_count', 'misfit_rms'],
+        'output_suffix': 'deltah'
     },
     'dhdt_lag1': {
-        'vars': ['dhdt', 'dhdt_sigma', 'ice_area'],
-        'suffix': 'lag1'
+        'nc_group': 'dhdt_lag1',
+        'sigma_var': 'dhdt_sigma',
+        'vars_to_keep': ['dhdt', 'dhdt_sigma', 'ice_area'],
+        'output_suffix': 'lag1'
     },
     'dhdt_lag4': {
-        'vars': ['dhdt', 'dhdt_sigma', 'ice_area'],
-        'suffix': 'lag4'
+        'nc_group': 'dhdt_lag4',
+        'sigma_var': 'dhdt_sigma',
+        'vars_to_keep': ['dhdt', 'dhdt_sigma', 'ice_area'],
+        'output_suffix': 'lag4'
     }
 }
 
-# Chunking for 1km input (approx 2GB per tile)
-INPUT_CHUNKS = {'time': 1, 'y': 2000, 'x': 2000}
+DASK_WORKERS = 4
+DASK_THREADS = 2
+DASK_MEMORY = "16GB"
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("ICESat-Merge")
+# =============================================================================
+# CORE FUNCTIONS
+# =============================================================================
 
-def get_dask_client():
-    """Start LocalCluster. Note: HDF5 often needs single-threaded readers."""
-    cluster = LocalCluster(
-        n_workers=4,
-        threads_per_worker=1,
-        memory_limit='6GB', # 2GB tile + overhead
-        dashboard_address=':8787'
-    )
-    client = Client(cluster)
-    logger.info(f"Dask Dashboard: {client.dashboard_link}")
-    return client
-
-def decode_atl15_time(ds: xr.Dataset) -> xr.Dataset:
-    """
-    Decodes ATL15 time: 'days since 2018-01-01'.
-    Standard xarray.open_dataset often fails on HDF5 groups without this.
-    Reference: [4]
-    """
-    if 'time' in ds.coords:
-        # Check if already decoded (datetime64)
-        if not np.issubdtype(ds.time.dtype, np.datetime64):
-            logger.info("  Decoding custom ATL15 time units...")
-            # Create baseline
-            base_date = pd.Timestamp("2018-01-01")
-            # Convert values to timedeltas
-            try:
-                # Ensure we are working with the data, not dask array for small coords
-                time_offsets = pd.to_timedelta(ds.time.values, unit='D')
-                ds = ds.assign_coords(time=base_date + time_offsets)
-            except Exception as e:
-                logger.warning(f"  Time decoding warning: {e}")
+def fix_coordinates(ds: xr.Dataset, resolution: float = 1000.0) -> xr.Dataset:
+    """Snaps coordinates to nearest 1km grid to prevent misalignment."""
+    ds = ds.sortby('x').sortby('y', ascending=False)
+    new_x = np.round(ds.x.values / resolution) * resolution
+    new_y = np.round(ds.y.values / resolution) * resolution
+    ds = ds.assign_coords(x=new_x, y=new_y)
     return ds
 
-def standardize_coordinates(ds: xr.Dataset) -> xr.Dataset:
-    """
-    Enforces EPSG:3031 strict monotonicity.
-    y must be descending (North -> South).
-    x must be ascending (West -> East).
-    Reference: [1] [2]
-    """
-    # 1. Rename dims if necessary (ATL15 usually correct, but safety first)
-    # 2. Sort Y Descending
-    if ds.y < ds.y[-1]:
-        logger.info("  Sorting Y coordinate (ascending -> descending)")
-        ds = ds.sortby('y', ascending=False)
+def preproc_tile(ds: xr.Dataset) -> xr.Dataset:
+    """Decodes time and standardizes dataset."""
+    if not np.issubdtype(ds.time.dtype, np.datetime64):
+        if 'units' not in ds.time.attrs:
+            ds.time.attrs['units'] = "days since 2018-01-01"
+        ds = xr.decode_cf(ds)
     
-    # 3. Sort X Ascending
-    if ds.x > ds.x[-1]:
-        logger.info("  Sorting X coordinate (descending -> ascending)")
-        ds = ds.sortby('x', ascending=True)
+    # >>> TEST MODE SLICING <<<
+    if TEST_MODE:
+        # Slice lazily - Dask will optimize the load
+        ds = ds.isel(time=slice(0, 1))
         
     return ds
 
-def load_tile(filepath: Path, group: str, vars_to_keep: list) -> xr.Dataset:
-    """Load a single ATL15 tile group."""
-    if not filepath.exists():
-        logger.warning(f"File not found: {filepath}")
-        return None
+def create_virtual_1km_grid(datasets: list) -> xr.Dataset:
+    """Creates the seamless canvas for the continent."""
+    x_min = min([ds.x.min().item() for ds in datasets])
+    x_max = max([ds.x.max().item() for ds in datasets])
+    y_min = min([ds.y.min().item() for ds in datasets])
+    y_max = max([ds.y.max().item() for ds in datasets])
     
-    try:
-        # Load specific group
-        ds = xr.open_dataset(
-            filepath, 
-            group=group, 
-            chunks=INPUT_CHUNKS,
-            engine='h5netcdf' 
-        )
+    x_coords = np.arange(x_min, x_max + 1000, 1000)
+    y_coords = np.arange(y_max, y_min - 1000, -1000)
+    
+    return xr.Dataset(coords={'x': x_coords, 'y': y_coords, 'time': datasets.time})
+
+def merge_group(datasets: list, template: xr.Dataset, config: dict) -> xr.Dataset:
+    """Merges a specific variable group using 'Lowest Uncertainty First'."""
+    sigma_var = config['sigma_var']
+    vars_to_keep = config['vars_to_keep']
+    
+    print(f"    [Merge] Stacking tiles for {sigma_var}...")
+    
+    aligned = []
+    for i, ds in enumerate(datasets):
+        valid_vars = [v for v in vars_to_keep if v in ds]
+        ds_sub = ds[valid_vars]
+        ds_aligned = ds_sub.reindex_like(template, method=None, tolerance=1e-5)
+        ds_aligned['tile_id'] = i
+        aligned.append(ds_aligned)
         
-        # Filter variables immediately to save memory
-        # Only keep what exists in this tile
-        valid_vars = [v for v in vars_to_keep if v in ds.variables]
-        ds = ds[valid_vars]
-        
-        # Fix Time and Space
-        ds = decode_atl15_time(ds)
-        ds = standardize_coordinates(ds)
-        
-        return ds
-    except Exception as e:
-        logger.error(f"Failed to load {filepath} [{group}]: {e}")
-        return None
+    combined = xr.concat(aligned, dim='tile')
+    
+    print(f"    [Merge] resolving overlaps via nanargmin({sigma_var})...")
+    sigma_filled = combined[sigma_var].fillna(np.inf)
+    best_idx = sigma_filled.argmin(dim='tile')
+    
+    merged = combined.isel(tile=best_idx)
+    return merged.drop_vars('tile', errors='ignore')
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
-    # HDF5 is not thread-safe by default, lock it just in case
-    dask.config.set(scheduler='synchronized') 
-    # Use standard client for computation
-    client = get_dask_client()
+    cluster = LocalCluster(n_workers=DASK_WORKERS, threads_per_worker=DASK_THREADS, memory_limit=DASK_MEMORY)
+    client = Client(cluster)
+    print(f"[System] Dask Client: {client}")
     
-    # Cleanup previous run
-    if INTERMEDIATE_ZARR.exists() and TEST_MODE:
-        shutil.rmtree(INTERMEDIATE_ZARR)
-
+    if TEST_MODE:
+        print("\n" + "="*60)
+        print("  WARNING: TEST_MODE IS ENABLED. PROCESSING 1 TIMESTEP ONLY.")
+        print("="*60 + "\n")
+    
     try:
-        for group_name, config in GROUPS.items():
-            logger.info(f"Processing Group: {group_name} (Suffix: {config['suffix']})")
+        for key, config in GROUPS.items():
+            print(f"\n[Processing] Group: {key}")
             
+            # 1. Load Tiles
+            print("  [Load] Loading datasets...")
             datasets = []
-            target_vars = config['vars']
-
-            # Load A1-A4
-            for quadrant in ['A1', 'A2', 'A3', 'A4']:
-                # Flexible pattern match for version numbers (e.g., 0311, 0328)
-                files = list(INPUT_DIR.glob(f"ATL15_{quadrant}_*.nc"))
-                if not files:
-                    logger.warning(f"  Missing tile: {quadrant}")
-                    continue
-                
-                # Take the first match (assuming one version present)
-                ds = load_tile(files, group_name, target_vars)
-                if ds:
-                    datasets.append(ds)
-
-            if not datasets:
-                logger.error(f"No datasets found for {group_name}. Skipping.")
-                continue
-
-            # --- Merge Step ---
-            # Reference [5]: "If tiles DO overlap: Create mosaic...". 
-            # combine_by_coords handles non-overlapping perfectly. 
-            # For overlapping edges, we use 'compat="override"' to prioritize A1>A2>A3>A4 
-            # effectively, unless we implement the heavy "sigma-min" reduction.
-            # Given memory constraints, we use combine_by_coords for V1.
-            logger.info(f"  Merging {len(datasets)} tiles...")
-            
             try:
-                ds_merged = xr.combine_by_coords(
-                    datasets,
-                    coords='minimal', 
-                    compat='override', # Resolves overlaps by taking the first one
-                    combine_attrs='drop'
-                )
-            except ValueError as e:
-                logger.error(f"  Merge failed. Check coordinate alignment. Error: {e}")
+                for name, path in TILES.items():
+                    # Load minimal chunks for metadata
+                    ds = xr.open_dataset(
+                        path, 
+                        group=config['nc_group'], 
+                        chunks={'time': 1, 'x': 2048, 'y': 2048}
+                    )
+                    ds = fix_coordinates(ds)
+                    ds = preproc_tile(ds) # Slicing happens here if TEST_MODE=True
+                    datasets.append(ds)
+            except Exception as e:
+                print(f"  [Error] Failed to load tiles for {key}: {e}")
                 continue
 
-            # --- Test Mode ---
-            if TEST_MODE:
-                logger.info("  TEST_MODE: Slicing first timestep.")
-                ds_merged = ds_merged.isel(time=slice(0, 1))
-
-            # --- Validation Fragment ---
-            # Check for empty grid (common issue if coords misaligned)
-            if ds_merged.nbytes == 0:
-                logger.error("  Resulting dataset is empty! Check inputs.")
-                continue
-
-            # --- Save ---
-            group_path = INTERMEDIATE_ZARR / group_name
-            logger.info(f"  Saving to {group_path}...")
+            # 2. Build Grid
+            print("  [Grid] Building virtual canvas...")
+            template = create_virtual_1km_grid(datasets)
             
-            ds_merged.to_zarr(
-                group_path, 
-                mode='w', 
-                consolidated=True
-            )
-            logger.info(f"  Finished {group_name}")
+            # 3. Merge
+            merged_ds = merge_group(datasets, template, config)
+            
+            # 4. Write
+            output_filename = f"icesat2_1km_seamless_{config['output_suffix']}.zarr"
+            out_path = os.path.join(OUTPUT_DIR, output_filename)
+            
+            merged_ds.rio.write_crs(CRS_EPSG, inplace=True)
+            merged_ds.attrs['source'] = f"ICESat-2 ATL15 {key} (Merged)"
+            if TEST_MODE:
+                 merged_ds.attrs['test_mode'] = "True: Single timestep only"
+            
+            print(f"  [Write] Saving to {out_path}...")
+            if os.path.exists(out_path):
+                import shutil
+                shutil.rmtree(out_path)
+            
+            merged_ds.to_zarr(out_path, mode='w', consolidated=True)
+            print(f"  [Success] {output_filename} created.")
 
     finally:
         client.close()
+        cluster.close()
 
 if __name__ == "__main__":
     main()
