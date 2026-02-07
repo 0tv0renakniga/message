@@ -6,9 +6,9 @@ COMPUTATIONAL GLACIOLOGY AUDIT LOG
 -------------------------------------------------------------------------------
 DATE: 2026-02-07
 AUTHOR: SYSTEM (Skeptical Gatekeeper)
-STATUS: PRODUCTION
-LOGIC:  Upsample 1km ICESat-2 mosaics to 500m Master Grid using xeSMF.
-        Enforces reuse of regridding weights.
+STATUS: PRODUCTION (Step 01 Logic Applied)
+LOGIC:  Upsample 1km ICESat-2 to 500m Master Grid.
+        generates 2D Lat/Lon coordinates for xeSMF (Source 15/Step 01).
 -------------------------------------------------------------------------------
 """
 
@@ -20,13 +20,13 @@ import xarray as xr
 import xesmf as xe
 import dask.config
 from dask.distributed import Client, LocalCluster
+from pyproj import Transformer
 
 # --- MANDATORY PREAMBLE ---
-warnings.filterwarnings("ignore")  # Silence xesmf/pyproj warnings
+warnings.filterwarnings("ignore")
 xr.set_options(keep_attrs=True)
 
 # --- CONFIGURATION (THE "SQUEEZE" SETUP) ---
-# Proven on your 55GB/12Core node. 
 DASK_CONFIG = {
     "n_workers": 4,
     "threads_per_worker": 2, 
@@ -67,52 +67,94 @@ TASKS = {
 
 WEIGHT_FILE = "weights_icesat_1km_to_500m.nc"
 
+def get_grid_geometry(ds: xr.Dataset, name: str) -> xr.Dataset:
+    """
+    Generates the explicit 2D Lat/Lon grid required by xeSMF.
+    Replicates Step 01 Logic (Source 15).
+    """
+    print(f"[Geometry] Generating 2D coordinates for {name}...")
+    
+    # 1. Extract 1D Vectors
+    x = ds.x.values
+    y = ds.y.values
+    
+    # 2. Create 2D Meshgrid (Heavy Operation)
+    # This creates full (Y, X) matrices
+    xx, yy = np.meshgrid(x, y)
+    
+    # 3. Transform to Lat/Lon (EPSG:3031 -> EPSG:4326)
+    transformer = Transformer.from_crs("EPSG:3031", "EPSG:4326", always_xy=True)
+    lon, lat = transformer.transform(xx, yy)
+    
+    # 4. Wrap in xarray for xeSMF
+    ds_geo = xr.Dataset(
+        coords={
+            'lon': (['y', 'x'], lon),
+            'lat': (['y', 'x'], lat)
+        }
+    )
+    
+    print(f"  > Generated geometry shape: {ds_geo.lon.shape}")
+    return ds_geo
+
 def verify_grid_compatibility(src: xr.Dataset, dst: xr.Dataset):
     """
-    Ensures the 1km grid and 500m grid are resoluion-compatible.
-    Uses robust SCALAR math to avoid array crashes.
+    Ensures resolution compatibility.
+    Uses safe scalar logic.
     """
     print("[Audit] Verifying Grid Compatibility...")
     
-    # 1. Get Extents (Scalars)
     src_xmin, src_xmax = src.x.min().item(), src.x.max().item()
     dst_xmin, dst_xmax = dst.x.min().item(), dst.x.max().item()
     
-    # 2. Get Counts (Integers) - The safest way to avoid scalar/array confusion
     src_n = len(src.x)
     dst_n = len(dst.x)
     
-    # 3. Calculate Average Sampling Resolution (Scalar Math)
-    # Formula: Span / (Steps - 1)
-    src_res = (src_xmax - src_xmin) / (src_n - 1)
-    dst_res = (dst_xmax - dst_xmin) / (dst_n - 1)
+    # Resolution = Span / (Steps - 1)
+    src_res = abs((src_xmax - src_xmin) / (src_n - 1))
+    dst_res = abs((dst_xmax - dst_xmin) / (dst_n - 1))
     
     print(f"  > Source Res: {src_res:.4f}m | Target Res: {dst_res:.4f}m")
     
-    # 4. Assertions (Resolution Only)
     if not np.isclose(src_res, 1000.0, atol=1.0):
         raise ValueError(f"Source resolution is not 1km! Found {src_res}")
     
     if not np.isclose(dst_res, 500.0, atol=0.5):
         raise ValueError(f"Target resolution is not 500m! Found {dst_res}")
 
-    print("  [PASS] Resolutions are valid for regridding.")
+    print("  [PASS] Resolutions are valid.")
 
 
-def create_regridder(src_grid, dst_grid, reuse_weights=True):
+def create_regridder(ds_src_ref, ds_dst_ref, reuse_weights=True):
     """
-    Initializes the xeSMF regridder. 
-    Only calculates weights if they don't exist.
+    Initializes xeSMF using explicit 2D Lat/Lon grids.
     """
     if os.path.exists(WEIGHT_FILE) and reuse_weights:
         print(f"[Regrid] Loading existing weights: {WEIGHT_FILE}")
-        regridder = xe.Regridder(src_grid, dst_grid, 'bilinear', 
+        # When reusing weights, we don't need the heavy geometry, just valid placeholders
+        # But to be safe, we pass the geometry if we have it, or simple ones.
+        # Ideally, we construct the object to match the weight file.
+        
+        # We must regenerate geometry to initialize the regridder object correctly 
+        # even if reading weights from disk, unless we use a "dummy" grid.
+        # For safety, we generate them.
+        geo_src = get_grid_geometry(ds_src_ref, "Source (1km)")
+        geo_dst = get_grid_geometry(ds_dst_ref, "Target (500m)")
+        
+        regridder = xe.Regridder(geo_src, geo_dst, 'bilinear', 
                                  weights=WEIGHT_FILE, reuse_weights=True)
     else:
         print(f"[Regrid] Calculating NEW weights (Bilinear 1km->500m)...")
-        print("  > This is a heavy operation. Watch memory.")
-        regridder = xe.Regridder(src_grid, dst_grid, 'bilinear', 
+        
+        # 1. Generate Heavy Geometry
+        geo_src = get_grid_geometry(ds_src_ref, "Source (1km)")
+        geo_dst = get_grid_geometry(ds_dst_ref, "Target (500m)")
+        
+        # 2. Build Regridder
+        regridder = xe.Regridder(geo_src, geo_dst, 'bilinear', 
                                  filename=WEIGHT_FILE, reuse_weights=False)
+        
+        # 3. Force Compute
         _ = regridder.weights 
         print(f"[Regrid] Weights saved to {WEIGHT_FILE}")
         
@@ -138,15 +180,17 @@ def process_task(task_key: str, config: dict, regridder, client):
     
     # 1. Open Source
     ds_src = xr.open_zarr(in_path, consolidated=False)
-    
-    # 2. Select Variables
     ds_subset = ds_src[config['var_list']]
+    
+    # 2. Rename Dimensions for xeSMF
+    # xeSMF expects dimensions to match the geometry coordinates (y, x)
+    # Our data is (time, y, x). This is compatible.
     
     # 3. Apply Regridding
     print("  > Applying bilinear interpolation...")
     ds_regridded = regridder(ds_subset)
     
-    # 4. Post-Process & Type Casting
+    # 4. Post-Process
     ds_regridded.attrs = ds_src.attrs
     ds_regridded.attrs['history'] = f"Upsampled to 500m using xeSMF bilinear. Source: {config['input']}"
     ds_regridded.attrs['resolution'] = "500m"
@@ -156,7 +200,7 @@ def process_task(task_key: str, config: dict, regridder, client):
              ds_regridded[var] = ds_regridded[var].astype(np.float32)
         ds_regridded[var].attrs = ds_src[var].attrs
     
-    # 5. Physics Audit (Post-Regrid)
+    # 5. Physics Audit
     if 'delta_h' in ds_regridded:
         v_max = ds_regridded['delta_h'].max().compute().item()
         if abs(v_max) > 600: 
@@ -164,8 +208,6 @@ def process_task(task_key: str, config: dict, regridder, client):
 
     # 6. Write to Zarr
     print(f"  > Writing to {out_path}...")
-    
-    # Chunking: 500m grid is 12288x12288
     ds_regridded = ds_regridded.chunk({'time': 1, 'y': 2048, 'x': 2048})
     
     compressor = dict(compressor=None)
@@ -197,11 +239,13 @@ def main():
         
     ds_src_ref = xr.open_zarr(src_ref_path, consolidated=False)
     
-    # SCALAR Verification Only
+    # Verify Resolution
     verify_grid_compatibility(ds_src_ref, ds_master)
     
+    # Initialize Regridder (using Step 01 Geometry Logic)
     regridder = create_regridder(ds_src_ref, ds_master)
     
+    # Run Tasks
     for key, cfg in TASKS.items():
         try:
             process_task(key, cfg, regridder, client)
