@@ -6,9 +6,9 @@ COMPUTATIONAL GLACIOLOGY AUDIT LOG
 -------------------------------------------------------------------------------
 DATE: 2026-02-07
 AUTHOR: SYSTEM (Skeptical Gatekeeper)
-STATUS: PRODUCTION
-LOGIC:  "Lowest Uncertainty First" (Source: [1], [2])
-        Iterative masking used over stack-argmin for graph stability.
+STATUS: PRODUCTION (Hotfix: Unit Awareness)
+LOGIC:  "Lowest Uncertainty First" (Source: [1])
+        Hardware Config: Optimized for 55GB/12Core Node.
 -------------------------------------------------------------------------------
 """
 
@@ -24,14 +24,12 @@ from dask.distributed import Client, LocalCluster
 warnings.filterwarnings("ignore", category=UserWarning)  # Silence pyproj warnings
 xr.set_options(keep_attrs=True)
 
-# --- CONFIGURATION ---
-# If you are running this on a laptop, you are doing it wrong.
-# If on HPC, adjust workers to match your SLURM allocation.
+# --- CONFIGURATION (OPTIMIZED FOR 55GB RAM / 12 CORES) ---
 TEST_MODE = False  # Set True to process only 1 timestamp
 DASK_CONFIG = {
-    "n_workers": 4,
-    "threads_per_worker": 2,
-    "memory_limit": "16GB"
+    "n_workers": 4,           # 4 Workers ensures large chunks fit in RAM
+    "threads_per_worker": 2,  # 8 Logical cores total (leaves 4 for OS/IO)
+    "memory_limit": "11GB"    # 44GB Total (leaves 11GB Safety Buffer)
 }
 
 DIRS = {
@@ -39,7 +37,6 @@ DIRS = {
     "output": "data/processed_layers/intermediate"
 }
 
-# The A1-A4 quadrants. If these files don't exist, the script dies.
 TILES = {
     'A1': f"{DIRS['input']}/ATL15_A1_0328_01km_005_01.nc",
     'A2': f"{DIRS['input']}/ATL15_A2_0328_01km_005_01.nc",
@@ -47,7 +44,6 @@ TILES = {
     'A4': f"{DIRS['input']}/ATL15_A4_0328_01km_005_01.nc",
 }
 
-# Variable mapping. We process these groups independently to save memory.
 GROUPS = {
     'delta_h': {
         'nc_group': 'delta_h',
@@ -74,27 +70,40 @@ def verify_physics(ds: xr.Dataset, context: str):
     """
     Mandatory physics audit.
     Rejects the dataset if it violates basic glaciological laws.
+    Updated to handle 'meters^2' vs 'fraction' for ice_area.
     """
     print(f"[{context}] Auditing physics...")
     
-    # 1. Check for infinite or absurd values
-    # ATL15 delta_h shouldn't exceed +/- 500m even in extreme collapse scenarios
+    # 1. Check for infinite or absurd values in height changes
     for var in ds.data_vars:
         if "sigma" not in var and "ice_area" not in var:
             v_max = ds[var].max().compute().item()
             v_min = ds[var].min().compute().item()
             if abs(v_max) > 500 or abs(v_min) > 500:
                 print(f"  [FATAL] {var} out of bounds: {v_min} to {v_max}")
-                # In production, raise Error. For now, warn loudly.
                 warnings.warn(f"Physical violation in {var}")
 
-    # 2. Check Ice Area Integrity
+    # 2. Check Ice Area Integrity (Adaptive)
     if 'ice_area' in ds:
         area_max = ds['ice_area'].max().compute().item()
-        if area_max > 1.01: # allow tiny float error
-            raise ValueError(f"Ice Area fraction > 1.0: {area_max}")
-        if area_max < 0.0:
-            raise ValueError("Ice Area fraction negative.")
+        area_min = ds['ice_area'].min().compute().item()
+        
+        if area_min < 0.0:
+            raise ValueError(f"Negative Ice Area detected: {area_min}")
+
+        # Check Order of Magnitude
+        if area_max > 2.0:
+            # Case A: Units are meters^2 (expect ~1e6)
+            # 1km pixel in EPSG:3031 can distort up to ~1.1e6. 
+            # We set limit at 2.0e6 to catch gross projection errors (like units in feet).
+            if area_max > 2.0e6:
+                raise ValueError(f"Ice Area too large for 1km grid: {area_max:.1f} m^2 (Limit: 2.0e6)")
+            print(f"  > Ice Area validated as meters^2 (Max: {area_max:.1f})")
+        else:
+            # Case B: Units are Fraction (0-1)
+            if area_max > 1.01:
+                raise ValueError(f"Ice Area fraction > 1.0: {area_max}")
+            print(f"  > Ice Area validated as Fraction (Max: {area_max:.4f})")
 
     print(f"[{context}] Physics Audit PASSED.")
 
@@ -154,7 +163,7 @@ def create_master_canvas(tile_paths: dict) -> xr.Dataset:
 
 def merge_group_logic(group_cfg: dict, canvas: xr.Dataset, tile_paths: dict):
     """
-    Implementation of 'Lowest Uncertainty First' merge logic.
+    Implementation of 'Lowest Uncertainty First' merge logic [Source 17].
     """
     group_name = group_cfg['nc_group']
     sigma_name = group_cfg['sigma_var']
@@ -162,15 +171,13 @@ def merge_group_logic(group_cfg: dict, canvas: xr.Dataset, tile_paths: dict):
     
     print(f"\n[Merge] Processing group: {group_name}...")
 
-    # Initialize accumulation containers
-    # We start with None and populate with the first tile we process
     merged_ds = None
     
     # Iterate through tiles
     for tile_id, path in tile_paths.items():
         print(f"  > Loading {tile_id}...")
         
-        # 1. Open Data
+        # 1. Open Data (Chunked)
         ds = xr.open_dataset(path, group=group_name, chunks={'time': 1, 'y': 2048, 'x': 2048})
         
         # 2. Slice Time for Test Mode
@@ -183,34 +190,22 @@ def merge_group_logic(group_cfg: dict, canvas: xr.Dataset, tile_paths: dict):
         # 4. Filter Variables
         ds = ds[vars_needed]
         
-        # 5. Reindex to Master Canvas (Pads missing areas with NaN)
-        # This is the "Sparse to Dense" transformation
+        # 5. Reindex to Master Canvas
         ds_aligned = ds.reindex(x=canvas.x, y=canvas.y)
         
         # 6. Merge Logic
         if merged_ds is None:
-            # First tile becomes the base
             merged_ds = ds_aligned
         else:
-            # COMPARISON: Current Master vs New Tile
-            # Where New_Sigma < Master_Sigma, replace Master with New.
-            
-            # We must handle NaNs. If Master is NaN, take New.
-            # If New is NaN, keep Master.
-            
             # Create masks
             new_sigma = ds_aligned[sigma_name]
             curr_sigma = merged_ds[sigma_name]
             
-            # Logic:
-            # 1. If new has valid data AND (current is NaN OR new_sigma < curr_sigma) -> Take New
-            
-            # Construct validity masks (not NaN)
+            # Logic: If new has valid data AND (current is NaN OR new_sigma < curr_sigma) -> Take New
             new_valid = new_sigma.notnull()
             curr_valid = curr_sigma.notnull()
             
             # The "Better Data" mask
-            # valid_new AND ( (not valid_curr) OR (new_sigma < curr_sigma) )
             better_mask = new_valid & (~curr_valid | (new_sigma < curr_sigma))
             
             # Update all variables in the dataset
@@ -221,10 +216,11 @@ def merge_group_logic(group_cfg: dict, canvas: xr.Dataset, tile_paths: dict):
 
 
 def main():
-    # 1. Initialize Dask
+    # 1. Initialize Dask with Optimized Config
     cluster = LocalCluster(**DASK_CONFIG)
     client = Client(cluster)
     print(f"[System] Dask Client active: {client.dashboard_link}")
+    print(f"[System] Workers: {DASK_CONFIG['n_workers']} | Mem: {DASK_CONFIG['memory_limit']}")
 
     # 2. Check Inputs
     os.makedirs(DIRS['output'], exist_ok=True)
@@ -249,15 +245,13 @@ def main():
         # Metadata
         ds_merged.attrs['title'] = f"ICESat-2 Antarctic Mosaic - {key}"
         ds_merged.attrs['crs'] = "EPSG:3031"
-        ds_merged.attrs['history'] = "Merged using Lowest-Uncertainty-First logic"
+        ds_merged.attrs['history'] = "Merged using Lowest-Uncertainty-First logic; Ice Area checked."
         
         # 5. Write to Zarr
         print(f"  > Writing to {out_path}...")
-        # Chunking strategy for Zarr: Time=1 (indep access), Spatial=1024 (reasonable tile size)
         ds_merged = ds_merged.chunk({'time': 1, 'y': 1024, 'x': 1024})
         
-        # Compute and Save
-        compressor = dict(compressor=None) # faster I/O for intermediate files
+        compressor = dict(compressor=None)
         encoding = {v: compressor for v in ds_merged.data_vars}
         
         ds_merged.to_zarr(out_path, mode='w', encoding=encoding, computed=True)
