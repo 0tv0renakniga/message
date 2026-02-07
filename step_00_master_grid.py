@@ -1,5 +1,6 @@
 import xarray as xr
 import numpy as np
+import rioxarray
 import os
 
 # Configuration
@@ -37,4 +38,4 @@ output_path = f"{OUTPUT_DIR}/master_grid_template.nc"
 ds_master.to_netcdf(output_path)
 
 print(f"Master Grid Saved: {output_path}")
-print(f""Dimensions: {len(x)}x{len(y)}")
+print(f"Dimensions: {len(x)}x{len(y)}")
