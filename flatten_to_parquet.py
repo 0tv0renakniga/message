@@ -148,6 +148,8 @@ def flatten_static():
         pa.Table.from_pandas(df, preserve_index=False),
         os.path.join(OUT_STATIC, "part-00000.parquet"),
         compression=PQ_COMPRESSION,
+        coerce_timestamps="us",
+        allow_truncated_timestamps=True,
     )
 
     del ds, df
@@ -211,6 +213,8 @@ def flatten_icesat_dynamic():
             pa.Table.from_pandas(df, preserve_index=False),
             os.path.join(OUT_ICESAT, f"step_{i:03d}.parquet"),
             compression=PQ_COMPRESSION,
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
         )
 
         del ds_t, df
@@ -272,6 +276,8 @@ def flatten_ocean_dynamic():
                 pa.Table.from_pandas(df, preserve_index=False),
                 os.path.join(OUT_OCEAN, f"step_{i:03d}.parquet"),
                 compression=PQ_COMPRESSION,
+                coerce_timestamps="us",
+                allow_truncated_timestamps=True,
             )
 
         del ds_t, df
@@ -307,6 +313,8 @@ def flatten_grace():
         pa.Table.from_pandas(df, preserve_index=False),
         os.path.join(OUT_GRACE, "part-00000.parquet"),
         compression=PQ_COMPRESSION,
+        coerce_timestamps="us",
+        allow_truncated_timestamps=True,
     )
 
     print(f"[Done]   [{_time.perf_counter() - t0:.1f} s]")

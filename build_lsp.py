@@ -25,6 +25,9 @@ Architecture
                                 |
                         forward fill per pixel
                                 |
+                     Constrained Forward Modeling
+                   (GRACE x ICESat-2 signal fusion)
+                                |
                            write LSP
 
 Join Logic
@@ -47,6 +50,32 @@ Window.partitionBy("y", "x").orderBy("time") carries the last valid
 observation forward for each temporal column independently.  This fills
 gaps where one sensor has data but another does not at that time step.
 Pixels with no preceding observation remain null (no backward fill).
+
+Signal Fusion (Constrained Forward Modeling)
+--------------------------------------------
+Downscales the coarse GRACE mascon-level mass change to the 500 m pixel
+level using the high-resolution ICESat-2 elevation-change pattern as a
+spatial template.
+
+    Forward model:   dm_forward_i = dh_i * rho_ice           (per pixel)
+    Constraint:      SUM(dm_fused_i * A_i) = DM_GRACE        (per mascon)
+    Scale factor:    alpha = DM_GRACE / SUM(dm_forward_i * A_i)
+    Fused signal:    lwe_fused_i = (dh_i / SUM(dh_j)) * N * lwe_length
+
+The ice density cancels in the normalisation, so the result depends only
+on the relative dh pattern and the GRACE total.  Verification:
+
+    area-weighted mean of lwe_fused = lwe_length   (exact for uniform grid)
+
+A uniform fallback is applied when the mascon-mean |dh| is below the
+noise floor (0.1 mm), since the ICESat-2 pattern cannot be trusted.
+
+Type Safety
+-----------
+NumPy datetime64[ns] -> PyArrow TIMESTAMP(NANOS) in Parquet.  PySpark's
+TimestampType is microsecond precision.  The _spark_safe_types() helper
+casts any non-TimestampType 'time' column before joins, and the Spark
+session writes TIMESTAMP_MICROS to the output LSP.
 
 Memory
 ------
@@ -75,23 +104,25 @@ LSP_PATH = os.path.join(DIR_FLATTENED, "antarctica_lsp.parquet")
 
 # Temporal columns to forward-fill per pixel.
 # Only columns that actually exist in the joined DataFrame are processed.
+# NOTE: lwe_fused is intentionally ABSENT -- it is a derived quantity
+#       computed from already-forward-filled delta_h and lwe_length.
 FFILL_COLS = [
     "delta_h", "ice_area", "h_surface_dynamic", "surface_slope",
     "thetao", "so", "T_f", "T_star", "lwe_length",
 ]
 
+# ── Signal Fusion constants ─────────────────────────────────────────────────
+#
+# Minimum mascon-mean |dh| (m) below which ICESat-2 cannot resolve the
+# spatial pattern and GRACE is distributed uniformly.
+# 0.1 mm is well below altimetric noise (~2 cm) -- this only catches
+# true numerical-zero cases.
+FUSION_MIN_MEAN_DH_M = 1e-4  # 0.1 mm
+
 DRIVER_MEMORY = "48g"
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
-
-def _ensure_timestamp(df, col="time"):
-    """Cast a column to TimestampType if it is not already."""
-    field = [f for f in df.schema.fields if f.name == col]
-    if field and not isinstance(field[0].dataType, TimestampType):
-        df = df.withColumn(col, F.to_timestamp(col))
-    return df
-
 
 def _validate_inputs():
     """Fail fast if any required Parquet directory is missing."""
@@ -104,6 +135,124 @@ def _validate_inputs():
             f"{len(missing)} required Parquet source(s) not found.  "
             "Run flatten_to_parquet.py first."
         )
+
+
+def _spark_safe_types(df, name=""):
+    """
+    Coerce DataFrame columns to PySpark-native types before joins.
+
+    Primary concern
+    ---------------
+    NumPy datetime64[ns]  ->  PyArrow TIMESTAMP(NANOS) in Parquet.
+    PySpark's TimestampType is microsecond precision.  On Spark < 3.4,
+    nanosecond Parquet timestamps can cause ArrowException or silent
+    truncation.  This function casts any non-TimestampType ``time``
+    column to TimestampType (us), providing a safe read path regardless
+    of how the upstream Parquet was written.
+
+    All other NumPy dtypes (float32/64, int32/64, bool) map cleanly
+    from PyArrow -> Spark with no conversion needed.
+    """
+    for field in df.schema.fields:
+        if field.name == "time" and not isinstance(field.dataType, TimestampType):
+            old_type = field.dataType
+            df = df.withColumn("time", F.to_timestamp(F.col("time")))
+            if name:
+                print(f"  [{name}] time: {old_type} -> TimestampType (us)")
+    return df
+
+
+def _fuse_grace_icesat(df):
+    """
+    Constrained Forward Modeling: downscale GRACE mascon-level mass change
+    to the 500 m pixel level using ICESat-2 dh as the spatial template.
+
+    Physics
+    -------
+    GRACE-FO measures total mass change (DM) at ~200 km mascon resolution.
+    ICESat-2 measures surface elevation change (dh) at ~500 m resolution.
+    Converting dh to mass (dm = dh * rho_ice) gives a "forward model" of
+    what GRACE should observe.  The ratio alpha = DM_GRACE / DM_forward is
+    the constrained scale factor.
+
+    After normalisation, rho_ice cancels:
+
+        w_i = dh_i / SUM_mascon(dh_j)        (signed weight, sums to 1.0)
+        lwe_fused_i = w_i * N * lwe_length    (per-pixel LWE, same units)
+
+    Verification:  area-weighted mean of lwe_fused == lwe_length  (exact
+    for the uniform 500 m EPSG:3031 grid).
+
+    Fallback
+    --------
+    When mascon-mean |dh| < FUSION_MIN_MEAN_DH_M (0.1 mm), ICESat-2
+    cannot resolve the spatial pattern.  The GRACE signal is distributed
+    uniformly: lwe_fused_i = lwe_length.
+
+    Guard rails
+    -----------
+    - Pixels with null mascon_id  -> lwe_fused = null  (no GRACE data)
+    - Pixels with null delta_h    -> lwe_fused = null  (no pattern)
+    - Pixels with null lwe_length -> lwe_fused = null  (no GRACE data)
+
+    Parameters (implicit via DataFrame columns)
+    --------------------------------------------
+    delta_h     : ICESat-2 elevation change (m), forward-filled
+    lwe_length  : GRACE mascon LWE anomaly (mm w.e.), forward-filled
+    mascon_id   : mascon identifier (integer)
+    time        : temporal coordinate
+
+    Returns
+    -------
+    DataFrame with added ``lwe_fused`` column (same units as lwe_length).
+    Intermediate columns are dropped.
+    """
+    w_mt = Window.partitionBy("mascon_id", "time")
+
+    # ── Mascon-level aggregates ────────────────────────────────────────
+    # N  = count of non-null delta_h in this mascon at this time step.
+    # Σh = sum of signed delta_h (normalisation denominator).
+    df = df.withColumn("_n_pix",  F.count("delta_h").over(w_mt))
+    df = df.withColumn("_sum_dh", F.sum("delta_h").over(w_mt))
+
+    # ── Pattern vs uniform decision ───────────────────────────────────
+    # If the mean signed |dh| in the mascon exceeds the noise floor,
+    # the ICESat-2 spatial pattern is trustworthy.
+    # |Σ dh / N| > threshold   =>   pattern mode
+    # otherwise                 =>   uniform fallback
+    use_pattern = (
+        F.abs(F.col("_sum_dh") / F.col("_n_pix"))
+        > F.lit(FUSION_MIN_MEAN_DH_M)
+    )
+
+    # ── Fused LWE per pixel ───────────────────────────────────────────
+    # Pattern:  lwe_fused = (dh_i / Σ dh_j) × N × lwe_length
+    # Uniform:  lwe_fused = lwe_length  (every pixel gets mascon average)
+    # Null:     lwe_fused = null        (missing GRACE or ICESat-2)
+    pattern_lwe = (
+        (F.col("delta_h") / F.col("_sum_dh"))
+        * F.col("_n_pix")
+        * F.col("lwe_length")
+    )
+
+    has_data = (
+        F.col("mascon_id").isNotNull()
+        & F.col("delta_h").isNotNull()
+        & F.col("lwe_length").isNotNull()
+    )
+
+    df = df.withColumn(
+        "lwe_fused",
+        F.when(
+            has_data,
+            F.when(use_pattern, pattern_lwe).otherwise(F.col("lwe_length"))
+        )
+    )
+
+    # ── Cleanup intermediate columns ──────────────────────────────────
+    df = df.drop("_n_pix", "_sum_dh")
+
+    return df
 
 
 # ── Pipeline ────────────────────────────────────────────────────────────────
@@ -122,6 +271,10 @@ def main():
         .config("spark.sql.shuffle.partitions", "200")
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.parquet.compression.codec", "zstd")
+        # Write timestamps as TIMESTAMP_MICROS (not legacy INT96).
+        # Ensures the output LSP is natively readable by any modern
+        # Parquet consumer without INT96-to-us rebasing.
+        .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -143,14 +296,16 @@ def main():
         ncol = len(df.columns)
         print(f"  -> {name:8s}  {ncol} cols  {df.columns}")
 
-    # ── 2. Normalise time columns ────────────────────────────────────────
+    # ── 2. Sanitise types (ns -> us timestamps) ──────────────────────────
     #
-    # Depending on how PyArrow serialised the timestamps, Spark may have
-    # read them as strings.  Cast to TimestampType for correct joins.
+    # NumPy datetime64[ns] may arrive as TIMESTAMP(NANOS) in Parquet.
+    # PySpark's TimestampType is us-precision.  Explicit casting prevents
+    # ArrowException on Spark < 3.4 and silent truncation everywhere.
     #
-    df_icesat = _ensure_timestamp(df_icesat, "time")
-    df_ocean  = _ensure_timestamp(df_ocean,  "time")
-    df_grace  = _ensure_timestamp(df_grace,  "time")
+    print("\n[Types]  Sanitising data types ...")
+    df_icesat = _spark_safe_types(df_icesat, "icesat2")
+    df_ocean  = _spark_safe_types(df_ocean,  "ocean")
+    df_grace  = _spark_safe_types(df_grace,  "grace")
 
     # ── 3. Temporal backbone: ICESat-2 FULL OUTER JOIN ocean ─────────────
     #
@@ -196,7 +351,7 @@ def main():
         .select(grace_cols)
         .withColumn("mascon_id", F.col("mascon_id").cast(IntegerType()))
     )
-    df_grace_clean = _ensure_timestamp(df_grace_clean, "time")
+    df_grace_clean = _spark_safe_types(df_grace_clean, "grace_join")
 
     df = df.join(df_grace_clean, on=["mascon_id", "time"], how="left")
     print(f"         [{_time.perf_counter() - t0:.1f} s  (lazy)]")
@@ -228,7 +383,24 @@ def main():
 
     print(f"         [{_time.perf_counter() - t0:.1f} s  (lazy)]")
 
-    # ── 7. Materialise and write LSP ─────────────────────────────────────
+    # ── 7. Signal Fusion: Constrained Forward Modeling ───────────────────
+    #
+    # Downscale the coarse GRACE mascon-level mass change to the 500 m
+    # pixel level using the forward-filled ICESat-2 dh pattern.
+    #
+    # lwe_fused_i = (dh_i / SUM(dh_j)) * N * lwe_length
+    #
+    # This runs AFTER forward fill so that fusion operates on the best
+    # available estimate at each time step.  lwe_fused itself is NOT
+    # forward-filled because it is already computed at every time step.
+    #
+    print("\n[Fuse]   Constrained Forward Modeling (GRACE x ICESat-2) ...")
+    t0 = _time.perf_counter()
+    df = _fuse_grace_icesat(df)
+    print(f"  -> lwe_fused  (noise floor = {FUSION_MIN_MEAN_DH_M} m)")
+    print(f"         [{_time.perf_counter() - t0:.1f} s  (lazy)]")
+
+    # ── 8. Materialise and write LSP ─────────────────────────────────────
     #
     # repartition(200) creates ~200 evenly-sized output files for
     # balanced downstream reads.  zstd compression is set at the
