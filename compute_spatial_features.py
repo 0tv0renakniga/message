@@ -141,6 +141,12 @@ def main():
     print("[Feat]   h_surface_dynamic = surface + delta_h")
     h_surface = (bedmap["surface"] + icesat_dh["delta_h"]).astype(np.float32)
 
+    # Ensure (time, y, x) ordering — icesat2 stores delta_h as (y, x, time)
+    # which propagates through the addition.  Transpose for consistency
+    # with the rest of the pipeline (step_04a/04b all emit time-first).
+    if "time" in h_surface.dims and h_surface.dims[0] != "time":
+        h_surface = h_surface.transpose("time", "y", "x")
+
     # ── 3. Slope magnitudes (map_overlap) ───────────────────────────────
     print("[Feat]   bed_slope = |∇(bed)|")
     bed_slope = compute_slope(bedmap["bed"])
